@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import json
+import select
+import copy
+
+
+class Router:
+    relations = {}
+    sockets = {}
+    ports = {}
+    updateMsgs = []
+    routingTable = []
+    revocations = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({"type": "handshake", "src": self.our_addr(
+                neighbor), "dst": neighbor, "msg": {}}))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode(
+            'utf-8'), ('localhost', self.ports[network]))
+
+    def getNetAddr(self, ip, mask):
+        ip = ip.split(".")
+        mask = mask.split(".")
+        netAddr = ""
+        for i in range(4):
+            netAddr += str(int(ip[i]) & int(mask[i]))
+            if (i != 3):
+                netAddr += "."
+        return netAddr
+
+    def findRoute(self, dst):
+        for route in self.routingTable:
+            if (self.getNetAddr(dst, route["netmask"]) == route["network"]):
+                return route
+        return None
+
+    def getMaskLen(self, mask):
+        def eightBitLength(num):
+            p = [0, 128, 192, 224, 240, 248, 252, 254, 255]
+            return p.index(num)
+        mask = mask.split(".")
+        maskLen = 0
+        for i in range(4):
+            maskLen += eightBitLength(int(mask[i]))
+        return maskLen
+
+    def lenToMask(self, length):
+        mask = ""
+        for i in range(4):
+            if (length >= 8):
+                mask += "255"
+                length -= 8
+            else:
+                mask += str(256 - 2**(8 - length))
+                length = 0
+            if (i != 3):
+                mask += "."
+        return mask
+
+    def findBestRoute(self, dst):
+        # find all routes that match the destination
+        routes = []
+        for route in self.routingTable:
+            if (self.getNetAddr(dst, route["netmask"]) == route["network"]):
+                routes.append(route)
+
+        # if only one route matches, return it
+        if (len(routes) == 1):
+            return routes[0]
+
+        # find the routes with longest matching mask
+        longestRoutes = []
+        longestLen = 0
+        for route in routes:
+            if (self.getMaskLen(route["netmask"]) > longestLen):
+                longestRoutes = [route]
+                longestLen = self.getMaskLen(route["netmask"])
+            elif (self.getMaskLen(route["netmask"]) == longestLen):
+                longestRoutes.append(route)
+
+        if (len(longestRoutes) == 1):
+            return longestRoutes[0]
+
+        # find the routes with the highest local preference
+        bestRoutes = []
+        bestPref = 0
+        for route in longestRoutes:
+            if (route["localpref"] > bestPref):
+                bestRoutes = [route]
+                bestPref = route["localpref"]
+            elif (route["localpref"] == bestPref):
+                bestRoutes.append(route)
+
+        if (len(bestRoutes) == 1):
+            return bestRoutes[0]
+
+        # find the routes with selfOrigin = True
+        for route in bestRoutes:
+            if (route["selfOrigin"] == False):
+                bestRoutes.remove(route)
+
+        if (len(bestRoutes) == 1):
+            return bestRoutes[0]
+
+        # find the routes with the shortest ASPath
+        bestRoutes2 = []
+        bestLen = len(bestRoutes[0]["ASPath"])
+        for route in bestRoutes:
+            if (len(route["ASPath"]) < bestLen):
+                bestRoutes2 = [route]
+                bestLen = len(route["ASPath"])
+            elif (len(route["ASPath"]) == bestLen):
+                bestRoutes2.append(route)
+
+        if (len(bestRoutes2) == 1):
+            return bestRoutes2[0]
+
+        # find the routes with the best origin, IGP > EGP > UNK
+        def getOriginValue(origin):
+            if (origin == "IGP"):
+                return 2
+            elif (origin == "EGP"):
+                return 1
+            else:
+                return 0
+        bestRoutes3 = []
+        bestOrigin = bestRoutes2[0]["origin"]
+        for route in bestRoutes2:
+            if (getOriginValue(route["origin"]) > getOriginValue(bestOrigin)):
+                bestRoutes3 = [route]
+                bestOrigin = route["origin"]
+            elif (getOriginValue(route["origin"]) == getOriginValue(bestOrigin)):
+                bestRoutes3.append(route)
+
+        if (len(bestRoutes3) == 1):
+            return bestRoutes3[0]
+
+        # if there is still a tie, return the lowest ip address
+        def getIPValue(ip):
+            ip = ip.split(".")
+            return int(ip[0]) * 256 * 256 * 256 + int(ip[1]) * 256 * 256 + int(ip[2]) * 256 + int(ip[3])
+        bestRoute = bestRoutes3[0]
+        bestIP = bestRoute["peer"]
+        for route in bestRoutes3:
+            if (getIPValue(route["peer"]) < getIPValue(bestIP)):
+                bestRoute = route
+                bestIP = route["peer"]
+
+        return bestRoute
+
+    def addAndAggregate(self, tableItem):
+        def adjacentIP(ip1, mask1, ip2, mask2):
+            if (mask1 != mask2):
+                return {"adjacent": False, "newmask": ""}
+
+            # transform ip1 and ip2 into binary strings
+            ip1 = ip1.split(".")
+            ip2 = ip2.split(".")
+            ip1 = bin(int(ip1[0]))[2:].zfill(8) + bin(int(ip1[1]))[2:].zfill(8) + \
+                bin(int(ip1[2]))[2:].zfill(8) + bin(int(ip1[3]))[2:].zfill(8)
+            ip2 = bin(int(ip2[0]))[2:].zfill(8) + bin(int(ip2[1]))[2:].zfill(8) + \
+                bin(int(ip2[2]))[2:].zfill(8) + bin(int(ip2[3]))[2:].zfill(8)
+
+            # Have common prefix of one less than the mask length
+            masklen = self.getMaskLen(mask1)
+            for i in range(masklen - 2):
+                if (ip1[i] != ip2[i]):
+                    return {"adjacent": False, "newmask": ""}
+
+            # if the last bit is different, the two networks are adjacent
+            if (ip1[masklen - 1] != ip2[masklen - 1]):
+                # trun the mask length down by one
+                mask = mask1.split(".")
+                # find the last non-zero part
+                for i in range(3, -1, -1):
+                    if (int(mask[i]) != 0):
+                        break
+
+                return {"adjacent": True, "newmask": self.lenToMask(masklen - 1)}
+
+            # otherwise, they are not adjacent
+            return {"adjacent": False, "newmask": ""}
+
+        # find the adjacent networks
+        adjacent = None
+        res = None
+        for route in self.routingTable:
+            res = adjacentIP(route["network"], route["netmask"],
+                             tableItem["network"], tableItem["netmask"])
+            if (res["adjacent"]):
+                adjacent = route
+                self.routingTable.remove(route)
+                break
+
+        # if there is no adjacent network, just add the new network
+        if (adjacent == None):
+            self.routingTable.append(tableItem)
+            return
+
+        # if there is an adjacent network, and using the same route
+        if (adjacent["peer"] == tableItem["peer"]
+            and adjacent["ASPath"] == tableItem["ASPath"]
+            and adjacent["origin"] == tableItem["origin"]
+            and adjacent["localpref"] == tableItem["localpref"]
+                and adjacent["selfOrigin"] == tableItem["selfOrigin"]):
+            # aggregate the two networks
+            newmask = res["newmask"]  # newmask is not ""
+            adjacent["network"] = self.getNetAddr(adjacent["network"], newmask)
+            adjacent["netmask"] = newmask
+            self.addAndAggregate(adjacent)
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = ""
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+
+                print("Received message '%s' from %s" % (msg, srcif))
+                msg = json.loads(msg)
+
+                if (msg["type"] == "handshake"):
+                    print("Handshake from %s" % srcif)
+
+                elif (msg["type"] == "update"):
+                    # (1) save a copy of the announcement in case you need it later
+                    self.updateMsgs.append(copy.deepcopy(msg))
+                    # (2) add an entry to your forwarding table
+                    updateItem = copy.deepcopy(msg["msg"])
+                    tableItem = {}
+                    tableItem["network"] = updateItem["network"]
+                    tableItem["netmask"] = updateItem["netmask"]
+                    tableItem["peer"] = srcif
+                    tableItem["localpref"] = updateItem["localpref"]
+                    tableItem["ASPath"] = updateItem["ASPath"]
+                    tableItem["selfOrigin"] = updateItem["selfOrigin"]
+                    tableItem["origin"] = updateItem["origin"]
+                    # self.routingTable.append(tableItem)
+                    self.addAndAggregate(tableItem)
+                    # (3) if the announcement is from a peer or provider, forward it to all your customers
+                    #     if the announcement is from a customer, forward it to all your neighbors
+                    if (self.relations[srcif] == "peer" or self.relations[srcif] == "prov"):
+                        for neighbor in self.sockets:
+                            if (self.relations[neighbor] == "cust" and neighbor != srcif):
+                                nmsg = {}
+                                nmsg = copy.deepcopy(msg)
+                                nmsg["src"] = self.our_addr(neighbor)
+                                nmsg["dst"] = neighbor
+                                nmsg["msg"]["ASPath"].insert(0, self.asn)
+                                nmsg["msg"].pop("localpref", None)
+                                nmsg["msg"].pop("selfOrigin", None)
+                                nmsg["msg"].pop("origin", None)
+                                self.send(neighbor, json.dumps(nmsg))
+                    if (self.relations[srcif] == "cust"):
+                        for neighbor in self.sockets:
+                            if (neighbor != srcif):
+                                nmsg = {}
+                                nmsg = copy.deepcopy(msg)
+                                nmsg["src"] = self.our_addr(neighbor)
+                                nmsg["dst"] = neighbor
+                                nmsg["msg"]["ASPath"].insert(0, self.asn)
+                                nmsg["msg"].pop("localpref", None)
+                                nmsg["msg"].pop("selfOrigin", None)
+                                nmsg["msg"].pop("origin", None)
+                                self.send(neighbor, json.dumps(nmsg))
+
+                elif (msg["type"] == "data"):
+                    if (msg["dst"] == self.our_addr(srcif)):  # (for me)
+                        print("Received data message '%s' from %s" %
+                              (msg["msg"], srcif))
+                    else:  # (for others)
+                        route = self.findBestRoute(msg["dst"])
+                        if (route is None):  # no route, return a "no route" message
+                            self.send(srcif, json.dumps({"type": "no route", "src": self.our_addr(
+                                srcif), "dst": srcif, "msg": {}}))
+                        else:  # route exists, forward the message
+                            # drop if the message is not to customers and not from customers
+                            if (self.relations[route["peer"]] != "cust" and self.relations[srcif] != "cust"):
+                                continue
+                            self.send(route["peer"], json.dumps(msg))
+
+                elif (msg["type"] == "withdraw"):
+                    # (1) save a copy of the revocation, in case you need it later
+                    self.revocations.append(msg)
+                    # (2) remove the dead entry from the update message list
+                    for route in msg["msg"]:
+                        for updateMsg in self.updateMsgs:
+                            if (updateMsg["msg"]["network"] == route["network"] and updateMsg["msg"]["netmask"] == route["netmask"] and updateMsg["src"] == srcif):
+                                self.updateMsgs.remove(updateMsg)
+                    # (3) rebuild the forwarding table
+                    self.routingTable = []
+                    for updateMsg in self.updateMsgs:
+                        tableItem = {}
+                        tableItem["network"] = updateMsg["msg"]["network"]
+                        tableItem["netmask"] = updateMsg["msg"]["netmask"]
+                        tableItem["peer"] = updateMsg["src"]
+                        tableItem["localpref"] = updateMsg["msg"]["localpref"]
+                        tableItem["ASPath"] = updateMsg["msg"]["ASPath"]
+                        tableItem["selfOrigin"] = updateMsg["msg"]["selfOrigin"]
+                        tableItem["origin"] = updateMsg["msg"]["origin"]
+                        self.addAndAggregate(tableItem)
+                    # (4) possibly send copies of the revocation to other neighboring routers
+                    if (self.relations[srcif] == "peer" or self.relations[srcif] == "prov"):
+                        for neighbor in self.sockets:
+                            if (self.relations[neighbor] == "cust" and neighbor != srcif):
+                                nmsg = {}
+                                nmsg = copy.deepcopy(msg)
+                                nmsg["src"] = self.our_addr(neighbor)
+                                nmsg["dst"] = neighbor
+                                self.send(neighbor, json.dumps(nmsg))
+                    if (self.relations[srcif] == "cust"):
+                        for neighbor in self.sockets:
+                            if (neighbor != srcif):
+                                nmsg = {}
+                                nmsg = copy.deepcopy(msg)
+                                nmsg["src"] = self.our_addr(neighbor)
+                                nmsg["dst"] = neighbor
+                                self.send(neighbor, json.dumps(nmsg))
+
+                elif (msg["type"] == "dump"):
+                    retmsg = {}
+                    retmsg["src"] = self.our_addr(srcif)
+                    retmsg["dst"] = srcif
+                    retmsg["type"] = "table"
+                    retmsg["msg"] = self.routingTable
+                    self.send(srcif, json.dumps(retmsg))
+
+                else:
+                    continue
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections',
+                        type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
